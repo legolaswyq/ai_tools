@@ -1,0 +1,300 @@
+from PIL import Image
+import numpy as np
+import imgaug.augmenters as iaa
+import os 
+import glob 
+import random
+import multiprocessing as mp
+import argparse
+import cv2
+import math
+import uuid
+
+
+def rotate_image(array, angle):
+    height, width = array.shape[:2]
+    image_center = (width / 2, height / 2)
+
+    rotation_mat = cv2.getRotationMatrix2D(image_center, angle, 1)
+
+    radians = math.radians(angle)
+    sin = math.sin(radians)
+    cos = math.cos(radians)
+    bound_w = int((height * abs(sin)) + (width * abs(cos)))
+    bound_h = int((height * abs(cos)) + (width * abs(sin)))
+
+    rotation_mat[0, 2] += ((bound_w / 2) - image_center[0])
+    rotation_mat[1, 2] += ((bound_h / 2) - image_center[1])
+
+    rotated_mat = cv2.warpAffine(array, rotation_mat, (bound_w, bound_h))
+    return rotated_mat
+
+
+def patchify_per_barcode(src_dir, barcode, shuffle_patchify_dir):
+    files = glob.glob(f"{src_dir}/train*.jpg")
+    os.makedirs(os.path.join(shuffle_patchify_dir, barcode), exist_ok=True)
+    for file in files:
+        img = Image.open(file)
+        pachify = shuffle_patchify(img)
+        basename = os.path.basename(file)
+        dst = os.path.join(os.path.join(shuffle_patchify_dir, barcode), basename)
+        pachify.save(dst)
+
+
+def img_augmentation_sequence():
+    """
+    usage: 
+    seq.augment_images(imgs)
+    imgs is a list of image[np.array]
+    """
+    seq = iaa.Sequential([
+        iaa.Fliplr(0.5),
+        iaa.Flipud(0.5),
+        iaa.Sometimes(
+            0.7,
+            iaa.Crop(percent=(0.1,0.3)),
+        ),
+    ], random_order=True)
+
+    return seq
+
+
+def load_images(images):
+    imgs_np = []
+    for image in images:
+        img = Image.open(image)
+        img_np = np.array(img)
+        imgs_np.append(img_np)
+
+    if len(imgs_np) <= 2:
+        imgs_np = random.choices(imgs_np, k=3)
+
+    return imgs_np
+
+
+def imgs_augmentation(imgs):
+    augmented_imgs = []
+    seq = img_augmentation_sequence()
+    for img in imgs:
+        if random.random() > 0.3:
+            random_degree = random.choice([15, 30, 45, 60, 75])
+            img = rotate_image(img, random_degree)
+        img = seq.augment_image(img)
+        augmented_imgs.append(img)
+    
+    return augmented_imgs
+
+
+def resize(imgs, img_size=300):
+    # expect to be rgb np array 
+    resized_imgs = []
+    for img in imgs:
+        bgr_image = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        img = cv2.resize(bgr_image, (int(img_size/2) , int(img_size/2)), interpolation=cv2.INTER_CUBIC)
+        rgb_image = cv2.cvtColor(np.array(img), cv2.COLOR_BGR2RGB)
+        img_np = np.array(rgb_image)
+        resized_imgs.append(img_np)
+
+    return resized_imgs
+
+
+def form_fourview(imgs):
+    # expect images to be np.array order in rgb channel
+    assert len(imgs) == 3
+
+    threeview_np = np.hstack([imgs[0], imgs[1], imgs[2]])
+    # fourview_np = np.vstack(
+    #     [np.hstack([imgs[0], imgs[1]]),
+    #     np.hstack([imgs[2], imgs[3]])]
+    # )
+
+
+    return Image.fromarray(threeview_np)
+
+
+def save_fourview(fourview, fourview_out, barcode, save_name):
+    savedir = os.path.join(fourview_out, barcode)
+    os.makedirs(savedir, exist_ok=True)
+    dst = os.path.join(savedir, save_name)
+    fourview.save(dst)
+
+
+def _find_pair(find_pair, time_seq, cam_id_files):
+    for file in cam_id_files:
+        infos = os.path.basename(file).split("_")
+        seq = int(infos[-1].split(".")[0])
+        if seq >= time_seq:
+            find_pair.append(file)
+            return find_pair
+
+    return find_pair
+
+
+def find_pairs_3_cameras(pairs, cam_anchor, cam_target_1, cam_target_2, max_pairs=200):
+    for file in cam_anchor:
+        find_pair = [file]
+        infos = os.path.basename(file).split("_")
+        time_seq = int(infos[-1].split(".")[0])
+
+        find_pair = _find_pair(find_pair, time_seq, cam_target_1)
+        find_pair = _find_pair(find_pair, time_seq, cam_target_2)
+        
+        if len(pairs) >= max_pairs:
+            break
+
+        pairs.append(find_pair)
+
+    return pairs
+
+
+def find_pairs_2_cameras(pairs, cam_anchor, cam_target, max_pairs=200):
+    for file in cam_anchor:
+        find_pair = [file]
+        infos = os.path.basename(file).split("_")
+        time_seq = int(infos[-1].split(".")[0])
+
+        find_pair = _find_pair(find_pair, time_seq, cam_target)
+        
+        if len(pairs) >= max_pairs:
+            break
+
+        pairs.append(find_pair)
+
+    return pairs
+
+
+def prepare_train_val_dataset(crop_dir, barcode, train_num, val_num):
+    cameras = {str(i): [] for i in range(9)}
+    train_pair = []
+    val_pair = []
+
+    for file in glob.glob(f"{crop_dir}/{barcode}/**/*.jpg"):
+        infos = os.path.basename(file).split("_")
+        cam_id = infos[3]
+        cameras[cam_id].append(file)
+
+    for i in range(9):
+        cameras[str(i)] = sorted(cameras[str(i)])
+
+    # get training pair 
+    # three_pair = []
+    # three_pair = find_pairs_3_cameras(three_pair, cameras["1"], cameras["4"], cameras["8"], max_pairs=400)
+    # three_pair = find_pairs_3_cameras(three_pair, cameras["4"], cameras["8"], cameras["1"], max_pairs=400)
+    # three_pair = find_pairs_3_cameras(three_pair, cameras["8"], cameras["1"], cameras["4"], max_pairs=400)
+    # three_pair = find_pairs_3_cameras(three_pair, cameras["2"], cameras["6"], cameras["7"], max_pairs=400)
+    # three_pair = find_pairs_3_cameras(three_pair, cameras["6"], cameras["7"], cameras["2"], max_pairs=400)
+    # three_pair = find_pairs_3_cameras(three_pair, cameras["7"], cameras["2"], cameras["6"], max_pairs=400)
+    # three_pair = random.choices(three_pair, k=train_num)
+    
+
+    two_pair = []
+    two_pair = find_pairs_2_cameras(two_pair, cameras["0"], cameras["3"], max_pairs=400)
+    two_pair = random.choices(two_pair, k=train_num)
+    barcodes = os.listdir(crop_dir)
+    barcodes = barcodes.pop(barcode)
+    other_barcode = random.sample(barcodes, k=1)
+    crops = glob.glob(f"{crop_dir}/{other_barcode}/**/*.jpg")
+    print(crops)
+    
+    train_pair.extend(three_pair)
+    # train_pair.extend(two_pair)
+    
+    
+    # get val pair 
+    # three_pair = []
+    # three_pair = find_pairs_3_cameras(three_pair, cameras["0"], cameras["3"], cameras["5"], max_pairs=int(val_num / 2))
+    # three_pair = find_pairs_3_cameras(three_pair, cameras["3"], cameras["5"], cameras["0"], max_pairs=int(val_num / 2))
+    # three_pair = find_pairs_3_cameras(three_pair, cameras["5"], cameras["3"], cameras["0"], max_pairs=int(val_num / 2))
+    # three_pair = random.choices(three_pair, k=int(val_num / 2))
+
+    # two_pair = []
+    # two_pair = find_pairs_2_cameras(two_pair, cameras["3"], cameras["5"], max_pairs=int(val_num / 2))
+    # two_pair = find_pairs_2_cameras(two_pair, cameras["3"], cameras["0"], max_pairs=int(val_num / 2))
+    # two_pair = find_pairs_2_cameras(two_pair, cameras["5"], cameras["0"], max_pairs=int(val_num / 2))
+    # two_pair = random.choices(two_pair, k=int(val_num / 2))
+
+    # val_pair.extend(three_pair)
+    # val_pair.extend(two_pair)
+    
+
+    return train_pair, val_pair
+
+
+def shuffle_patchify(img, num_patches=8):
+    img_np = np.array(img)
+
+    # Get the dimensions of the image
+    height, width, channels = img_np.shape
+
+    # Calculate the size of each patch
+    patch_height = height // num_patches
+    patch_width = width // num_patches
+
+    # Create an array to store the patches
+    patches = []
+
+    # Extract patches from the image
+    for i in range(num_patches):
+        for j in range(num_patches):
+            patch = img_np[i * patch_height:(i + 1) * patch_height,
+                            j * patch_width:(j + 1) * patch_width, :]
+            patches.append(patch)
+
+    # Shuffle the patches
+    np.random.shuffle(patches)
+
+    # Create a mosaic by concatenating the shuffled patches
+    mosaic = np.concatenate([np.concatenate(patches[j:j + num_patches], axis=1) for j in range(0, len(patches), num_patches)], axis=0)
+
+    # Convert the NumPy array back to a PIL image
+    mosaic_pil = Image.fromarray(mosaic)
+    return mosaic_pil
+
+
+def per_barcode(crop_dir, fourview_out, barcode, train_num, val_num, is_shuffle_patchify, augmented_val):
+
+    train_pair, val_pair = prepare_train_val_dataset(crop_dir, barcode, train_num, val_num)
+
+    for i in range(train_num):
+        imgs = load_images(train_pair[i])
+        # imgs = imgs_augmentation(imgs)
+        imgs = resize(imgs)
+        fourview = form_fourview(imgs)
+        fourview.show()
+        save_fourview(fourview, fourview_out, barcode, f"train_{i}.jpg")
+
+   
+
+
+
+crop_in = "/home/walter/big_daddy/walter_stuff/onboard/crops"
+three_view_out = "/home/walter/nas_cv/walter_stuff/raw_data/three-view-negative"
+os.makedirs(three_view_out, exist_ok=True)
+barcodes = os.listdir(crop_in)
+
+while(len(barcodes) > 0):
+    anchor_barcode = random.choice(barcodes)
+    barcodes.remove(anchor_barcode)
+    the_other_barcode = random.choice(barcodes)
+
+
+    target_cam = os.path.join(crop_in, anchor_barcode, "0")
+    target_jpg = glob.glob(f"{target_cam}/*.jpg")
+    match_cam = os.path.join(crop_in, anchor_barcode, "3")
+    match_jpg = glob.glob(f"{match_cam}/*.jpg")
+    two_pair = find_pairs_2_cameras([], target_jpg, match_jpg, max_pairs=200)
+    two_pair = random.sample(two_pair, 15)
+
+    path = os.path.join(crop_in, the_other_barcode, "5")
+    the_other_barcode_jpgs = glob.glob(f"{crop_in}/*/5/*.jpg")
+    for pair in two_pair:
+        pair.append(random.choice(the_other_barcode_jpgs))
+        imgs = load_images(pair)
+        resized_imgs = resize(imgs)
+        random.shuffle(resized_imgs)
+        three_view = form_fourview(resized_imgs)
+        three_view.save(os.path.join(three_view_out, f"{uuid.uuid4()}.jpg"))
+
+
+
+
